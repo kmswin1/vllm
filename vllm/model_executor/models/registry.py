@@ -95,6 +95,11 @@ _TEXT_GENERATION_MODELS = {
     # the sparse indexer when the HF config has `index_topk` (and MSA block-selection when the config
     # carries `msa_block_selection`). Architecture/dims mirror DeepSeek-V3.2.
     "AXK2ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+    # A.X K3: AXK2 MLA/MoE backbone with per-layer interleaved attention at N:1
+    # -- N local MLA-SWA (sliding window + attention sink) layers per 1 global
+    # block-sparse MLA (MSA) layer. Served by its own module (adds the SWA path
+    # + output gate + gated RMSNorm on top of the DeepSeek-V3.2 sparse MLA).
+    "AXK3ForCausalLM": ("axk3", "AXK3ForCausalLM"),
     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
