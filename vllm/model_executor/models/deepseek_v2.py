@@ -644,6 +644,23 @@ class Indexer(nn.Module):
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
+
+        # MSA block-sparse selection (MiniMax Sparse Attention, arXiv:2606.13392): when the HF config
+        # carries `msa_block_selection`, the selection switches from DSA token-level top-k to block
+        # max-pool -> top-k blocks -> token indices (the Megatron-trained MSA rule). `index_topk` is
+        # then a TOKEN budget = topk_blocks * msa_block_size. The index branch (wq_b/wk_weights_proj)
+        # and the fp8 idx_k cache below are shared with the DSA path.
+        if bool(getattr(config, "msa_block_selection", False)):
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                configure_msa_block_selection,
+            )
+
+            _msa_block = int(getattr(config, "msa_block_size", 128))
+            assert self.topk_tokens % _msa_block == 0, (
+                f"index_topk ({self.topk_tokens}) must be a multiple of "
+                f"msa_block_size ({_msa_block}) so topk_blocks * block == index_topk."
+            )
+            configure_msa_block_selection(True, _msa_block)
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,

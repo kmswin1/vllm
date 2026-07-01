@@ -291,6 +291,37 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+import os as _os
+
+# MSA block-sparse selection (MiniMax Sparse Attention, arXiv:2606.13392): when enabled, the whole
+# DSA indexer (fp8_mqa_logits + per-row TOP-K TOKEN selection) is replaced by MSA's single-head
+# plain-dot block selection (msa_block_select.msa_select_prefill_rows): block max-pool -> top-k
+# BLOCKS -> token indices. fp8_mqa_logits / fp8_fp4_paged_mqa_logits CANNOT serve MSA (they assert
+# num_heads in {8,16,32,64}; MSA's index head count is 1), so MSA computes the selection straight
+# from the dequantized index q/k -- no relu, no per-head weights -- matching training. Default OFF ->
+# the DSA path is byte-for-byte unchanged. topk_blocks = index_topk // block_size.
+_MSA_BLOCK_SELECTION = bool(int(_os.environ.get("VLLM_MSA_BLOCK_SELECTION", "0") or "0"))
+_MSA_BLOCK_SIZE = int(_os.environ.get("VLLM_MSA_BLOCK_SIZE", "128") or "128")
+# MSA indexer scoring compute precision for the fused Triton scorer: "fp8" (default -- fp8 tensor-core
+# tl.dot, fast + low register) | "bf16" | "fp32" | "fp4" (B200/sm100 only). 1-head MSA keeps its 1 head
+# (no DeepGEMM padding): at prefill the tl.dot M dimension comes from the 256-query block, so 1-head
+# still saturates tensor cores. Selection (top-k blocks) is robust to the lower dot precision.
+_MSA_INDEX_DTYPE = (_os.environ.get("VLLM_MSA_INDEX_DTYPE", "fp8") or "fp8").lower()
+
+
+def configure_msa_block_selection(enabled: bool, block_size: int = 128, index_dtype: str | None = None) -> None:
+    """Switch the indexer's selection rule from DSA token-level top-k to MSA block-level selection
+    (block max-pool -> top-k blocks -> token indices), driven by the HF config at model build time
+    (overrides the ``VLLM_MSA_BLOCK_SELECTION`` env default). ``index_dtype`` (fp8/bf16/fp32/fp4) picks
+    the fused-scorer compute precision. Idempotent — safe to call once per layer's indexer __init__."""
+    global _MSA_BLOCK_SELECTION, _MSA_BLOCK_SIZE, _MSA_INDEX_DTYPE
+    _MSA_BLOCK_SELECTION = bool(enabled)
+    if block_size:
+        _MSA_BLOCK_SIZE = int(block_size)
+    if index_dtype:
+        _MSA_INDEX_DTYPE = str(index_dtype).lower()
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -437,6 +468,42 @@ def sparse_attn_indexer(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
+            if _MSA_BLOCK_SELECTION:
+                # MSA's index head count is 1, but fp8_mqa_logits asserts num_heads in {8,16,32,64}
+                # -> it CANNOT serve MSA. Compute the block selection straight from the dequantized
+                # index q/k with the faithful plain-dot rule (fused Triton per-q-block scorer when the
+                # chunk is a single contiguous sequence -- the long-context prefill case, matching
+                # flash_mla.block_sparse_prefill training granularity -- else per-row torch).
+                from vllm.v1.attention.ops.msa_block_select import (
+                    msa_select_prefill_rows, msa_dot_mode)
+
+                assert not use_fp4_cache, "MSA targets the fp8 index cache (not fp4)"
+                # q's per-row fp8 scale is folded into `weights` (a positive per-row constant) -> it
+                # does not change a row's block ranking, so the raw fp8 q is fine for selection. k's
+                # per-key scale DOES vary across keys -> apply it. softmax_scale is a global positive
+                # constant (rank-invariant); use head_dim**-0.5 for faithfulness.
+                idx_q = q_slice.float()
+                if idx_q.dim() == 2:  # [rows, D] -> [rows, 1, D]
+                    idx_q = idx_q.unsqueeze(1)
+                idx_k = k_quant.float() * k_scale.view(torch.float32).reshape(k_quant.shape[0], -1)[:, :1]
+                q_pos = chunk.cu_seqlen_ke.to(torch.long) - 1
+                sel, _len = msa_select_prefill_rows(
+                    idx_q,
+                    idx_k,
+                    q_pos,
+                    chunk.cu_seqlen_ks.to(torch.long),
+                    max(1, topk_tokens // _MSA_BLOCK_SIZE),
+                    k_quant.shape[0],
+                    _MSA_BLOCK_SIZE,
+                    head_dim ** -0.5,
+                    msa_dot_mode(_MSA_INDEX_DTYPE, idx_q.device),
+                )
+                w = min(sel.shape[1], topk_indices.shape[1])
+                topk_indices[:, :w] = sel[:, :w].to(topk_indices.dtype)
+                if w < topk_indices.shape[1]:
+                    topk_indices[:, w:] = -1
+                continue
+
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
@@ -543,7 +610,38 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        if _MSA_BLOCK_SELECTION:
+            # 1-head MSA decode: fp8_fp4_paged_mqa_logits ALSO asserts num_heads in {8,16,32,64}, so
+            # it can't serve MSA. Score straight off the paged fp8 index-K cache with a FUSED Triton
+            # kernel -- no per-sequence gather, no full-prefix fp32 materialization, no Python loop ->
+            # block-max plain-dot -> top-k blocks -> token indices. Cache layout (cp_gather):
+            # [num_pages, page, head_dim+4] -> values [num_pages, page, head_dim] fp8 then per-token
+            # fp32 scale (last 4 bytes). kv_cache is NON-unsqueezed here (unsqueeze is the DSA path).
+            from vllm.v1.attention.ops.msa_block_select import msa_select_decode_paged
+
+            assert not use_fp4_cache, "MSA decode selection targets the fp8 index cache (not fp4)"
+            nb, cb = kv_cache.shape[0], kv_cache.shape[1]
+            kc = kv_cache.view(nb, -1)
+            value_cache = kc[:, : cb * head_dim].view(fp8_dtype).view(nb, cb, head_dim)
+            scale_cache = kc[:, cb * head_dim :].view(torch.float32)  # [nb, cb]
+            ctx_len = (seq_lens[:, -1] if seq_lens.ndim == 2 else seq_lens).reshape(-1).to(torch.long)
+            dev = hidden_states.device
+            q_rows = padded_q_quant_decode_tokens.reshape(num_padded_tokens, head_dim)  # [rows, D], H=1
+            ar = torch.arange(num_padded_tokens, device=dev)
+            row_seq = ar // next_n
+            q_pos = ctx_len[row_seq] - next_n + (ar % next_n)        # global causal pos per row
+            sel, _len = msa_select_decode_paged(
+                q_rows, value_cache, scale_cache, decode_metadata.block_table,
+                row_seq, q_pos, max(1, topk_tokens // _MSA_BLOCK_SIZE), max_model_len,
+                _MSA_BLOCK_SIZE, head_dim ** -0.5,
+            )
+            w = min(sel.shape[1], topk_indices.shape[1])
+            topk_indices[:, :w] = sel[:, :w].to(topk_indices.dtype)
+            if w < topk_indices.shape[1]:
+                topk_indices[:, w:] = -1
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -558,6 +656,11 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
+            num_rows = logits.shape[0]
+            ops.top_k_per_row_decode(
+                logits, next_n, seq_lens, topk_indices, num_rows,
+                logits.stride(0), logits.stride(1), topk_tokens,
+            )
         else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
@@ -569,59 +672,59 @@ def sparse_attn_indexer(
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
-        num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+            num_rows = logits.shape[0]
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        use_cooperative_topk = (
-            current_platform.is_cuda()
-            and topk_tokens in (512, 1024, 2048)
-            and num_rows <= 32
-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
-        )
-        if use_cooperative_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            use_cooperative_topk = (
+                current_platform.is_cuda()
+                and topk_tokens in (512, 1024, 2048)
+                and num_rows <= 32
+                and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
             )
-            torch.ops._C.cooperative_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+                512,
+                1024,
+                2048,
             )
-        elif use_persistent_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                logits.shape[1],
-            )
-        else:
-            ops.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            if use_cooperative_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.cooperative_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            elif use_persistent_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    logits.shape[1],
+                )
+            else:
+                ops.top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
